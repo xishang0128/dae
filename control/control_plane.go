@@ -33,6 +33,7 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
+	"github.com/daeuniverse/dae/pkg/logger"
 	"github.com/daeuniverse/softwind/pool"
 	"github.com/daeuniverse/softwind/protocol/direct"
 	"github.com/daeuniverse/softwind/transport/grpc"
@@ -42,6 +43,19 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
+
+type Options struct {
+	Log               *logrus.Logger
+	Bpf               interface{}
+	DnsCache          map[string]*DnsCache
+	TagToNodeList     map[string][]string
+	Groups            []config.Group
+	RoutingA          *config.Routing
+	Global            *config.Global
+	DnsConfig         *config.Dns
+	ExternGeoDataDirs []string
+	ChMsg             chan<- *Msg
+}
 
 type ControlPlane struct {
 	log *logrus.Logger
@@ -76,17 +90,11 @@ type ControlPlane struct {
 	soMarkFromDae     uint32
 }
 
-func NewControlPlane(
-	log *logrus.Logger,
-	_bpf interface{},
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-) (*ControlPlane, error) {
+func NewControlPlane(opts *Options) (*ControlPlane, error) {
+	log := opts.Log
+	if log == nil {
+		log = logger.NewLogger(logrus.InfoLevel.String(), false, nil)
+	}
 	var err error
 
 	kernelVersion, e := internal.KernelVersion()
@@ -100,12 +108,12 @@ func NewControlPlane(
 			kernelVersion.String(),
 			requirement.String())
 	}
-	if requirement := consts.CgSocketCookieFeatureVersion; len(global.WanInterface) > 0 && kernelVersion.Less(requirement) {
+	if requirement := consts.CgSocketCookieFeatureVersion; len(opts.Global.WanInterface) > 0 && kernelVersion.Less(requirement) {
 		return nil, fmt.Errorf("your kernel version %v does not support bind to WAN; expect >=%v; remove wan_interface in config file and try again",
 			kernelVersion.String(),
 			requirement.String())
 	}
-	if requirement := consts.SkAssignFeatureVersion; len(global.LanInterface) > 0 && kernelVersion.Less(requirement) {
+	if requirement := consts.SkAssignFeatureVersion; len(opts.Global.LanInterface) > 0 && kernelVersion.Less(requirement) {
 		return nil, fmt.Errorf("your kernel version %v does not support bind to LAN; expect >=%v; remove lan_interface in config file and try again",
 			kernelVersion.String(),
 			requirement.String())
@@ -131,7 +139,7 @@ func NewControlPlane(
 	}
 
 	/// Load pre-compiled programs and maps into the kernel.
-	if _bpf == nil {
+	if opts.Bpf == nil {
 		log.Infof("Loading eBPF programs and maps into the kernel...")
 		log.Infof("The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.")
 	}
@@ -150,8 +158,8 @@ func NewControlPlane(
 		Programs: ProgramOptions,
 	}
 	var bpf *bpfObjects
-	if _bpf != nil {
-		if _bpf, ok := _bpf.(*bpfObjects); ok {
+	if opts.Bpf != nil {
+		if _bpf, ok := opts.Bpf.(*bpfObjects); ok {
 			bpf = _bpf
 		} else {
 			return nil, fmt.Errorf("unexpected bpf type: %T", _bpf)
@@ -176,7 +184,7 @@ func NewControlPlane(
 		bpf,
 		outboundId2Name,
 		&kernelVersion,
-		_bpf != nil,
+		opts.Bpf != nil,
 	)
 	defer func() {
 		if err != nil {
@@ -193,26 +201,26 @@ func NewControlPlane(
 
 	/// Bind to links. Binding should be advance of dialerGroups to avoid un-routable old connection.
 	// Bind to LAN
-	if len(global.LanInterface) > 0 {
+	if len(opts.Global.LanInterface) > 0 {
 		if err = core.setupRoutingPolicy(); err != nil {
 			return nil, err
 		}
-		if global.AutoConfigKernelParameter {
+		if opts.Global.AutoConfigKernelParameter {
 			_ = SetIpv4forward("1")
 		}
-		global.LanInterface = common.Deduplicate(global.LanInterface)
-		for _, ifname := range global.LanInterface {
-			if err = core.bindLan(ifname, global.AutoConfigKernelParameter); err != nil {
+		opts.Global.LanInterface = common.Deduplicate(opts.Global.LanInterface)
+		for _, ifname := range opts.Global.LanInterface {
+			if err = core.bindLan(ifname, opts.Global.AutoConfigKernelParameter); err != nil {
 				return nil, fmt.Errorf("bindLan: %v: %w", ifname, err)
 			}
 		}
 	}
 	// Bind to WAN
-	if len(global.WanInterface) > 0 {
+	if len(opts.Global.WanInterface) > 0 {
 		if err = core.setupSkPidMonitor(); err != nil {
 			return nil, err
 		}
-		for _, ifname := range global.WanInterface {
+		for _, ifname := range opts.Global.WanInterface {
 			if err = core.bindWan(ifname); err != nil {
 				return nil, fmt.Errorf("bindWan: %v: %w", ifname, err)
 			}
@@ -220,36 +228,46 @@ func NewControlPlane(
 	}
 
 	/// DialerGroups (outbounds).
-	if global.AllowInsecure {
+	if opts.Global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
 	}
 	option := &dialer.GlobalOption{
 		Log: log,
 		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{
-			Raw:             global.TcpCheckUrl,
+			Raw:             opts.Global.TcpCheckUrl,
 			Log:             log,
-			ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
-			Method:          global.TcpCheckHttpMethod,
+			ResolverNetwork: common.MagicNetwork("udp", opts.Global.SoMarkFromDae),
+			Method:          opts.Global.TcpCheckHttpMethod,
 		},
 		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{
-			Raw:             global.UdpCheckDns,
-			ResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
-			Somark:          global.SoMarkFromDae,
+			Raw:             opts.Global.UdpCheckDns,
+			ResolverNetwork: common.MagicNetwork("udp", opts.Global.SoMarkFromDae),
+			Somark:          opts.Global.SoMarkFromDae,
 		},
-		CheckInterval:     global.CheckInterval,
-		CheckTolerance:    global.CheckTolerance,
-		CheckDnsTcp:       true,
-		AllowInsecure:     global.AllowInsecure,
-		TlsImplementation: global.TlsImplementation,
-		UtlsImitate:       global.UtlsImitate,
+		CheckInterval:  opts.Global.CheckInterval,
+		CheckTolerance: opts.Global.CheckTolerance,
+		CheckDnsTcp:    true,
+		CheckCb: func(result *dialer.CheckResult) {
+			if opts.ChMsg == nil {
+				return
+			}
+			opts.ChMsg <- &Msg{
+				Type:      ConnectivityCheck_Done,
+				Timestamp: time.Now(),
+				Body:      result,
+			}
+		},
+		AllowInsecure:     opts.Global.AllowInsecure,
+		TlsImplementation: opts.Global.TlsImplementation,
+		UtlsImitate:       opts.Global.UtlsImitate,
 	}
 
 	// Dial mode.
-	dialMode, err := consts.ParseDialMode(global.DialMode)
+	dialMode, err := consts.ParseDialMode(opts.Global.DialMode)
 	if err != nil {
 		return nil, err
 	}
-	sniffingTimeout := global.SniffingTimeout
+	sniffingTimeout := opts.Global.SniffingTimeout
 	if dialMode == consts.DialMode_Ip {
 		sniffingTimeout = 0
 	}
@@ -277,9 +295,9 @@ func NewControlPlane(
 	// FIXME: Ugly code here: reset grpc and meek clients manually.
 	grpc.CleanGlobalClientConnectionCache()
 	meek.CleanGlobalRoundTripperCache()
-	dialerSet := outbound.NewDialerSetFromLinks(option, tagToNodeList)
+	dialerSet := outbound.NewDialerSetFromLinks(option, opts.TagToNodeList)
 	deferFuncs = append(deferFuncs, dialerSet.Close)
-	for _, group := range groups {
+	for _, group := range opts.Groups {
 		// Parse policy.
 		policy, err := outbound.NewDialerSelectionPolicyFromGroupParam(&group)
 		if err != nil {
@@ -320,9 +338,9 @@ func NewControlPlane(
 		outboundId2Name[uint8(i)] = o.Name
 	}
 	// Apply rules optimizers.
-	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	locationFinder := assets.NewLocationFinder(opts.ExternGeoDataDirs)
 	var rules []*config_parser.RoutingRule
-	if rules, err = routing.ApplyRulesOptimizers(routingA.Rules,
+	if rules, err = routing.ApplyRulesOptimizers(opts.RoutingA.Rules,
 		&routing.AliasOptimizer{},
 		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
 		&routing.MergeAndSortRulesOptimizer{},
@@ -330,16 +348,16 @@ func NewControlPlane(
 	); err != nil {
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
-	routingA.Rules = nil // Release.
+	opts.RoutingA.Rules = nil // Release.
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
 		for _, rule := range rules {
 			debugBuilder.WriteString(rule.String(true, false, false) + "\n")
 		}
-		log.Debugf("RoutingA:\n%vfallback: %v\n", debugBuilder.String(), routingA.Fallback)
+		log.Debugf("RoutingA:\n%vfallback: %v\n", debugBuilder.String(), opts.RoutingA.Fallback)
 	}
 	// Parse rules and build.
-	builder, err := NewRoutingMatcherBuilder(log, rules, outboundName2Id, core.bpf, routingA.Fallback)
+	builder, err := NewRoutingMatcherBuilder(log, rules, outboundName2Id, core.bpf, opts.RoutingA.Fallback)
 	if err != nil {
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 	}
@@ -368,11 +386,11 @@ func NewControlPlane(
 		ready:             make(chan struct{}),
 		muRealDomainSet:   sync.Mutex{},
 		realDomainSet:     bloom.NewWithEstimates(2048, 0.001),
-		lanInterface:      global.LanInterface,
-		wanInterface:      global.WanInterface,
+		lanInterface:      opts.Global.LanInterface,
+		wanInterface:      opts.Global.WanInterface,
 		sniffingTimeout:   sniffingTimeout,
-		tproxyPortProtect: global.TproxyPortProtect,
-		soMarkFromDae:     global.SoMarkFromDae,
+		tproxyPortProtect: opts.Global.TproxyPortProtect,
+		soMarkFromDae:     opts.Global.SoMarkFromDae,
 	}
 	defer func() {
 		if err != nil {
@@ -381,17 +399,17 @@ func NewControlPlane(
 	}()
 
 	/// DNS upstream.
-	dnsUpstream, err := dns.New(dnsConfig, &dns.NewOption{
+	dnsUpstream, err := dns.New(opts.DnsConfig, &dns.NewOption{
 		Logger:                  log,
 		LocationFinder:          locationFinder,
 		UpstreamReadyCallback:   plane.dnsUpstreamReadyCallback,
-		UpstreamResolverNetwork: common.MagicNetwork("udp", global.SoMarkFromDae),
+		UpstreamResolverNetwork: common.MagicNetwork("udp", opts.Global.SoMarkFromDae),
 	})
 	if err != nil {
 		return nil, err
 	}
 	/// Dns controller.
-	fixedDomainTtl, err := ParseFixedDomainTtl(dnsConfig.FixedDomainTtl)
+	fixedDomainTtl, err := ParseFixedDomainTtl(opts.DnsConfig.FixedDomainTtl)
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +440,7 @@ func NewControlPlane(
 			}, nil
 		},
 		BestDialerChooser: plane.chooseBestDnsDialer,
-		IpVersionPrefer:   dnsConfig.IpVersionPrefer,
+		IpVersionPrefer:   opts.DnsConfig.IpVersionPrefer,
 		FixedDomainTtl:    fixedDomainTtl,
 	}); err != nil {
 		return nil, err
@@ -430,8 +448,8 @@ func NewControlPlane(
 	// Refresh domain routing cache with new routing.
 	// FIXME: We temperarily disable it because we want to make change of DNS section take effects immediately.
 	// TODO: Add change detection.
-	if false && len(dnsCache) > 0 {
-		for cacheKey, cache := range dnsCache {
+	if false && len(opts.DnsCache) > 0 {
+		for cacheKey, cache := range opts.DnsCache {
 			// Also refresh out-dated routing because kernel map items have no expiration.
 			lastDot := strings.LastIndex(cacheKey, ".")
 			if lastDot == -1 || lastDot == len(cacheKey)-1 {
@@ -448,7 +466,7 @@ func NewControlPlane(
 			}
 			_ = plane.dnsController.UpdateDnsCacheDeadline(host, uint16(typ), cache.Answer, cache.Deadline)
 		}
-	} else if _bpf != nil {
+	} else if opts.Bpf != nil {
 		// Is reloading, and dnsCache == nil.
 		// Remove all map items.
 		// Normally, it is due to the change of ip version preference.
@@ -482,6 +500,10 @@ func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {
 		m[strings.TrimSpace(key)] = int(ttl)
 	}
 	return m, nil
+}
+
+func (c *ControlPlane) Outbounds() []*outbound.DialerGroup {
+	return c.outbounds
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane.

@@ -21,8 +21,7 @@ type Dialer struct {
 	netproxy.Dialer
 	property *Property
 
-	collectionFineMu sync.Mutex
-	collections      [6]*collection
+	collections [6]*collection
 
 	tickerMu sync.Mutex
 	ticker   *time.Ticker
@@ -38,6 +37,7 @@ type GlobalOption struct {
 	CheckInterval     time.Duration
 	CheckTolerance    time.Duration
 	CheckDnsTcp       bool
+	CheckCb           func(result *CheckResult)
 	AllowInsecure     bool
 	TlsImplementation string
 	UtlsImitate       string
@@ -65,17 +65,16 @@ func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOpt
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Dialer{
-		GlobalOption:     option,
-		InstanceOption:   iOption,
-		Dialer:           dialer,
-		property:         property,
-		collectionFineMu: sync.Mutex{},
-		collections:      collections,
-		tickerMu:         sync.Mutex{},
-		ticker:           nil,
-		checkCh:          make(chan time.Time, 1),
-		ctx:              ctx,
-		cancel:           cancel,
+		GlobalOption:   option,
+		InstanceOption: iOption,
+		Dialer:         dialer,
+		property:       property,
+		collections:    collections,
+		tickerMu:       sync.Mutex{},
+		ticker:         nil,
+		checkCh:        make(chan time.Time, 1),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
 	if iOption.CheckEnabled {
 		go d.aliveBackground()
