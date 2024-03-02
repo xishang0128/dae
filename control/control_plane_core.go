@@ -449,6 +449,36 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		return nil
 	})
 
+	filterWanIngress := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           c.bpf.bpfPrograms.TproxyWanIngress.FD(),
+		Name:         consts.AppName + "_wan_ingress",
+		DirectAction: true,
+	}
+	_ = netlink.FilterDel(filterWanIngress)
+	// Remove and add.
+	if !c.isReload {
+		// Clean up thoroughly.
+		filterIngressFlipped := deepcopy.Copy(filterWanIngress).(*netlink.BpfFilter)
+		filterIngressFlipped.FilterAttrs.Handle ^= 1
+		_ = netlink.FilterDel(filterIngressFlipped)
+	}
+	if err := netlink.FilterAdd(filterWanIngress); err != nil {
+		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+	}
+	c.deferFuncs = append(c.deferFuncs, func() error {
+		if err := netlink.FilterDel(filterWanIngress); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("FilterDel(%v:%v): %w", link.Attrs().Name, filterWanIngress.Name, err)
+		}
+		return nil
+	})
+
 	return nil
 }
 
